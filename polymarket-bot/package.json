@@ -13,9 +13,12 @@
     "test": "vitest run",
     "simulate": "tsx src/apps/simulate.ts",
     "paper:live": "tsx src/apps/paper-live.ts",
-    "record": "tsx src/apps/record.ts"
+    "record": "tsx src/apps/record.ts",
+    "limitless:paper": "tsx src/apps/limitless-paper.ts"
   },
   "dependencies": {
+    "socket.io-client": "^4.8.3",
+    "viem": "^2.52.2",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
   },

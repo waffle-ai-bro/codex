@@ -6,7 +6,7 @@ export type UpDown = "UP" | "DOWN";
 export interface MarketInfo {
   /** Internal id (venue:slug). */
   id: string;
-  venue: "polymarket" | "sim";
+  venue: "polymarket" | "limitless" | "sim";
   slug: string;
   asset: Asset;
   cadenceSec: 300 | 900;
