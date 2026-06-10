@@ -6,8 +6,9 @@
  * Requires outbound network access to Polymarket + Binance. Run:
  *   npm run paper:live -- --asset BTC --cadence 300
  *
- * NOTE: settlement here uses the Binance PROXY oracle; real settlement is
- * Chainlink Data Streams. Paper results carry that basis risk (spec B5).
+ * Oracle: Polymarket RTDS `crypto_prices_chainlink` (the closest public proxy
+ * to the actual Chainlink settlement feed) with Binance as fallback while the
+ * RTDS stream is quiet (spec B5 source priority).
  */
 import { mkdirSync, createWriteStream } from "node:fs";
 import { loadRiskLimits, loadSnipeConfig } from "../core/config.js";
@@ -16,6 +17,7 @@ import { formatMicros } from "../core/fixed.js";
 import type { Asset, MarketInfo, OracleTick, UpDown } from "../core/types.js";
 import { discoverUpDownMarkets } from "../connectors/polymarket/gamma.js";
 import { MarketWs } from "../connectors/polymarket/ws-market.js";
+import { RtdsOracle } from "../connectors/polymarket/rtds.js";
 import { BinanceOracle } from "../oracle/binance.js";
 import { PaperExchange } from "../execution/paper-exchange.js";
 import { RiskEngine } from "../risk/risk-engine.js";
@@ -48,20 +50,30 @@ async function main(): Promise<void> {
   };
 
   let lastOracle: OracleTick | null = null;
-  const oracle = new BinanceOracle(`${asset.toLowerCase()}usdt`, (tick) => {
+  let lastRtdsMs = 0;
+  const onOracle = (tick: OracleTick): void => {
     lastOracle = tick;
     record("oracle", tick);
     if (current) {
       if (current.strikeMicros === 0 && tick.tsMs >= current.openTsMs) {
         current = { ...current, strikeMicros: tick.valueMicros };
         strategy.trackMarket(current);
-        log.info("strike set from proxy oracle", { market: current.id, strike: formatMicros(tick.valueMicros) });
+        log.info("strike set", { market: current.id, source: tick.source, strike: formatMicros(tick.valueMicros) });
       }
       strategy.onOracle(current.id, tick);
       applyActions();
     }
+  };
+  // Primary: RTDS Chainlink stream (settlement-adjacent). Fallback: Binance.
+  const rtds = new RtdsOracle(asset, (tick) => {
+    lastRtdsMs = Date.now();
+    onOracle(tick);
   });
-  oracle.start();
+  rtds.start();
+  const binance = new BinanceOracle(`${asset.toLowerCase()}usdt`, (tick) => {
+    if (Date.now() - lastRtdsMs > 2_000) onOracle(tick);
+  });
+  binance.start();
 
   let current: MarketInfo | null = null;
   let ws: MarketWs | null = null;
@@ -137,6 +149,15 @@ async function main(): Promise<void> {
           }
           applyActions();
         },
+        onTickSizeChange: (tokenId, newTickMicros) => {
+          // Stale-tick orders get rejected by the venue; track the change.
+          if (!current) return;
+          if (tokenId === current.upTokenId || tokenId === current.downTokenId) {
+            current = { ...current, tickSizeMicros: newTickMicros };
+            strategy.trackMarket(current);
+            log.info("tick size changed", { tokenId, newTickMicros });
+          }
+        },
         onDisconnect: () => {
           // Safety: a dead feed means stale state; cancel resting paper orders.
           const n = exchange.cancelAll();
@@ -179,7 +200,8 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => {
     log.info("shutting down; cancelling paper orders", { cancelled: exchange.cancelAll() });
     ws?.stop();
-    oracle.stop();
+    rtds.stop();
+    binance.stop();
     recorder.end();
     process.exit(0);
   });

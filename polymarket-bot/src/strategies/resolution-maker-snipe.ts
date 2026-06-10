@@ -59,7 +59,10 @@ export class ResolutionMakerSnipe {
   ) {}
 
   trackMarket(info: MarketInfo): void {
-    if (!this.markets.has(info.id)) {
+    const existing = this.markets.get(info.id);
+    if (existing) {
+      existing.info = info; // refresh strike / tick size updates
+    } else {
       this.markets.set(info.id, { info, oracleWindow: [], fills: 0, done: false });
     }
   }

@@ -18,6 +18,8 @@ export interface MarketInfo {
   downTokenId: string;
   tickSizeMicros: number;
   negRisk: boolean;
+  /** Venue exchange contract (EIP-712 verifying contract), when the venue provides it. */
+  exchangeAddress?: string;
 }
 
 export interface BookTop {

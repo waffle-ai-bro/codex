@@ -85,6 +85,44 @@ describe("PaperExchange conservative fill model", () => {
     expect(ex.realizedPnl).toBe(500_000);
   });
 
+  it("book-cross mode fills when the ask quotes through our bid", () => {
+    const ex = new PaperExchange(0, true);
+    ex.onBook(book(940_000, 960_000, 0));
+    const o = ex.placePostOnlyBuy({ marketId: MARKET, tokenId: TOKEN, priceMicros: 950_000, sizeMicros: 10 * MICRO, tsMs: 2_000 });
+    expect(o.status).toBe("open");
+    // ask above our bid: no fill
+    ex.onBook({ ...book(930_000, 955_000, 0), tsMs: 3_000 });
+    expect(ex.fills.length).toBe(0);
+    // ask drops through our level: fill at OUR price
+    ex.onBook({ ...book(930_000, 945_000, 0), tsMs: 4_000 });
+    expect(ex.fills.length).toBe(1);
+    expect(ex.fills[0]!.priceMicros).toBe(950_000);
+  });
+
+  it("book-cross mode respects queue ahead and grace window", () => {
+    const ex = new PaperExchange(250, true);
+    ex.onBook(book(950_000, 960_000, 80 * MICRO)); // joining: 80 ahead
+    ex.placePostOnlyBuy({ marketId: MARKET, tokenId: TOKEN, priceMicros: 950_000, sizeMicros: 10 * MICRO, tsMs: 2_000 });
+    // inside grace: ignored
+    ex.onBook({ tokenId: TOKEN, bidMicros: 940_000, askMicros: 945_000, bidSizeMicros: 0, askSizeMicros: 50 * MICRO, tsMs: 2_100 });
+    expect(ex.fills.length).toBe(0);
+    // after grace: 50 offered eats queue only (80 ahead)
+    ex.onBook({ tokenId: TOKEN, bidMicros: 940_000, askMicros: 945_000, bidSizeMicros: 0, askSizeMicros: 50 * MICRO, tsMs: 3_000 });
+    expect(ex.fills.length).toBe(0);
+    // next crossing update: 30 left of queue, then we fill
+    ex.onBook({ tokenId: TOKEN, bidMicros: 940_000, askMicros: 945_000, bidSizeMicros: 0, askSizeMicros: 50 * MICRO, tsMs: 3_500 });
+    expect(ex.fills.length).toBe(1);
+    expect(ex.fills[0]!.sizeMicros).toBe(10 * MICRO);
+  });
+
+  it("book-cross mode is off by default", () => {
+    const ex = new PaperExchange(0);
+    ex.onBook(book(940_000, 960_000, 0));
+    ex.placePostOnlyBuy({ marketId: MARKET, tokenId: TOKEN, priceMicros: 950_000, sizeMicros: 10 * MICRO, tsMs: 2_000 });
+    expect(ex.onBook({ ...book(930_000, 940_000, 0), tsMs: 3_000 })).toEqual([]);
+    expect(ex.fills.length).toBe(0);
+  });
+
   it("loss settles to -cost and open orders are cancelled at resolution", () => {
     const ex = new PaperExchange(0);
     ex.onBook(book(940_000, 960_000, 0));

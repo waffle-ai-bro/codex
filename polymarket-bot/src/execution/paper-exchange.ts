@@ -20,6 +20,12 @@ import type {
  *  - Trades within `graceMs` of placement never fill us (network latency).
  *
  * Positions settle to $1 or $0 at resolution.
+ *
+ * Venues without a public trade-print stream (e.g. Limitless market-data
+ * sockets expose orderbook updates only) can enable `fillOnBookCross`: a
+ * resting bid fills when the best ASK drops to or below our price — i.e. the
+ * market traded/quoted through our level, so a resting bid would have been
+ * lifted. Queue-ahead still applies via the crossing ask's visible size.
  */
 export class PaperExchange {
   private seq = 0;
@@ -32,10 +38,49 @@ export class PaperExchange {
   private realizedPnlUsdMicros = 0;
   private readonly lastBook = new Map<string, BookTop>();
 
-  constructor(private readonly graceMs = 250) {}
+  constructor(
+    private readonly graceMs = 250,
+    private readonly fillOnBookCross = false,
+  ) {}
 
-  onBook(top: BookTop): void {
+  onBook(top: BookTop): PaperFill[] {
     this.lastBook.set(top.tokenId, top);
+    if (!this.fillOnBookCross) return [];
+    const out: PaperFill[] = [];
+    for (const o of this.orders.values()) {
+      if (o.status !== "open") continue;
+      if (o.tokenId !== top.tokenId) continue;
+      if (top.tsMs <= o.placedTsMs + this.graceMs) continue;
+      if (top.askMicros > o.priceMicros) continue; // ask still above our bid
+      // The book quoted through our level: treat the crossing ask's visible
+      // size as the sell volume available to us, after queue ahead.
+      let volume = top.askSizeMicros > 0 ? top.askSizeMicros : o.remainingMicros;
+      if (o.queueAheadMicros > 0) {
+        const eaten = Math.min(o.queueAheadMicros, volume);
+        o.queueAheadMicros -= eaten;
+        volume -= eaten;
+      }
+      if (volume <= 0) continue;
+      const fillSize = Math.min(volume, o.remainingMicros);
+      o.remainingMicros -= fillSize;
+      if (o.remainingMicros === 0) o.status = "filled";
+      const fill: PaperFill = {
+        orderId: o.id,
+        marketId: o.marketId,
+        tokenId: o.tokenId,
+        priceMicros: o.priceMicros,
+        sizeMicros: fillSize,
+        tsMs: top.tsMs,
+      };
+      this.fills.push(fill);
+      out.push(fill);
+      this.positions.set(o.tokenId, (this.positions.get(o.tokenId) ?? 0) + fillSize);
+      this.costBasis.set(
+        o.tokenId,
+        (this.costBasis.get(o.tokenId) ?? 0) + notionalUsdMicros(o.priceMicros, fillSize),
+      );
+    }
+    return out;
   }
 
   placePostOnlyBuy(args: {

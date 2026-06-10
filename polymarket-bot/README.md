@@ -1,132 +1,206 @@
 # polymarket-bot
 
-TypeScript prediction-market bot implementing the **ResolutionMakerSnipe** module from
-`prediction_market_bot_build_spec_v2` + the Moon Dev / PolySnipe addendum: a last-minute
-**post-only maker bid** on the locked side of Polymarket short-duration (5m/15m) BTC/ETH
-Up/Down markets, with strict entry conditions, stand-down guards, risk gates, and a
-deliberately conservative paper-trading engine.
+TypeScript prediction-market bot for **short-duration (5m/15m) crypto Up/Down markets** on
+**Polymarket** and **Limitless (Base)**, implementing the **ResolutionMakerSnipe** strategy
+from the build spec + Moon Dev / PolySnipe addendum: a last-minute **post-only maker bid**
+on the locked side, with strict entry conditions, stand-down guards, shared risk gates, and
+a deliberately conservative paper-trading engine.
 
-**No live trading exists in this codebase.** All execution goes through a paper exchange.
+**Live trading is off by default and triple-gated.** Everything runs as paper trading until
+you explicitly flip the switches described below.
 
-## Layout
+---
+
+## 1. Install
+
+Requirements: **Node.js >= 22** (uses native `fetch`), npm.
+
+```bash
+cd polymarket-bot
+npm install
+cp .env.example .env        # then edit .env (only needed for live data / trading)
+```
+
+Verify the build:
+
+```bash
+npm run typecheck           # tsc strict mode, no emit
+npm test                    # 85 unit/smoke tests
+```
+
+## 2. Run
+
+### Offline profitability study (no network, no keys)
+
+```bash
+npm run simulate -- --markets 2000 --seed 42          # single run
+npm run simulate -- --markets 1500 --grid             # adverse-selection x entry-price grid
+npm run simulate -- --markets 5000 --max-entry 0.97   # custom entry cap
+```
+
+### Record real market data (network, no keys) — do this first
+
+Phase 1 of the spec: capture tick data for the go/no-go analysis.
+
+```bash
+npm run record -- --asset BTC --cadence 300           # Polymarket 5m BTC, no strategy
+```
+
+Output: `data/ticks-*.jsonl` (markets, book tops, trades, oracle ticks).
+
+### Paper trade against live books (network, no keys)
+
+```bash
+npm run paper:live      -- --asset BTC --cadence 300  # Polymarket
+npm run limitless:paper -- --asset BTC --cadence 300  # Limitless (Base)
+```
+
+Both run the full strategy + risk engine + paper exchange against live data, log every
+decision, and record all ticks. `limitless:paper` additionally mirrors strategy actions
+through the live executor **in dry-run** (orders are built and EIP-712-signed but never
+submitted) when `LIMITLESS_PRIVATE_KEY` is set — useful for verifying payloads.
+
+### Live trading (Limitless; only after the checklist in §6)
+
+All three must be set, deliberately:
+
+```bash
+TRADING_ENABLED=true LIMITLESS_TRADING_ENABLED=true LIMITLESS_DRY_RUN=false \
+  npm run limitless:paper -- --asset BTC --cadence 300
+```
+
+There is intentionally **no Polymarket live executor yet** (spec stages paper → tiny live).
+
+## 3. Environment variables
+
+Public market data needs **no keys** on either venue. Copy `.env.example` and fill in what
+you use:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LOG_LEVEL` | `info` | `debug` shows raw WS event routing |
+| `TRADING_ENABLED` | `false` | Master live-trading switch (both venues) |
+| `LIMITLESS_TRADING_ENABLED` | `false` | Second switch required for Limitless live orders |
+| `LIMITLESS_DRY_RUN` | `true` | Build + sign + log orders without submitting |
+| `POLYMARKET_GAMMA_BASE` | gamma-api.polymarket.com | Market discovery REST |
+| `POLYMARKET_CLOB_HOST` | clob.polymarket.com | CLOB REST (books) |
+| `POLYMARKET_WS_MARKET_URL` | ws-subscriptions-clob…/ws/market | Market WS channel |
+| `POLYMARKET_RTDS_URL` | ws-live-data.polymarket.com | RTDS (Chainlink crypto prices) |
+| `LIMITLESS_API_BASE` | api.limitless.exchange | REST |
+| `LIMITLESS_WS_BASE` | ws.limitless.exchange | Socket.IO (`/markets` namespace) |
+| `LIMITLESS_API_KEY` | — | `X-API-Key` for authenticated REST (profile/orders) |
+| `LIMITLESS_PRIVATE_KEY` | — | EOA key, signs orders only; dedicated small hot wallet |
+| `LIMITLESS_VERIFYING_CONTRACT` | — | Optional pin; normally read from `market.venue.exchange` |
+| `LIMITLESS_DOMAIN_NAME` | `Limitless CTF Exchange` | EIP-712 domain (SDK-verified) |
+| `LIMITLESS_CHAIN_ID` | `8453` | Base mainnet |
+| `LIMITLESS_ORDER_TYPE` | `GTC` | `GTD` = GTC + expiration (`LIMITLESS_ORDER_TTL_SEC`) |
+
+Secret hygiene: keys are read from env only, never logged (the logger redacts
+`key|secret|signature|token|…` fields), and never required for paper mode.
+
+## 4. Layout
 
 ```
 src/core/        fixed-point math (no floats for money), types, config (zod), logger
 src/strategies/  resolution-maker-snipe.ts  - deterministic strategy state machine
                  post-only-bid.ts           - spec B3 price chooser
 src/risk/        risk-engine.ts             - pre-trade gates + kill switch (manual unlock)
-src/execution/   paper-exchange.ts          - conservative maker fill model
+src/execution/   paper-exchange.ts          - conservative maker fill model (trade-print
+                                              mode + book-cross mode)
                  limitless-executor.ts      - live trading service (risk-gated, dry-run default)
 src/connectors/  polymarket/gamma.ts        - market discovery (slug-based, 5m/15m windows)
                  polymarket/clob.ts         - public REST book fetch + normalization
-                 polymarket/ws-market.ts    - market WebSocket (reconnect, normalize)
-                 limitless/client.ts        - Limitless (Base) REST: discovery, books, orders
-                 limitless/socket.ts        - Limitless Socket.IO feed (book/trade/oracle)
-                 limitless/auth.ts          - wallet-signature session login (viem)
-                 limitless/orders.ts        - EIP-712 CLOB order build + sign (CTF-style)
-src/oracle/      binance.ts                 - PROXY oracle (NOT the settlement source)
+                 polymarket/ws-market.ts    - market WS: book, price_change, best_bid_ask,
+                                              tick_size_change, last_trade_price
+                 polymarket/rtds.ts         - RTDS crypto_prices_chainlink oracle feed
+                 limitless/client.ts        - REST: discovery, books, profile, orders
+                 limitless/socket.ts        - Socket.IO /markets: orderbookUpdate, oraclePriceData
+                 limitless/orders.ts        - EIP-712 CTF order build + sign (Base 8453)
+src/oracle/      binance.ts                 - fallback proxy oracle (NOT a settlement source)
 src/sim/         market-sim.ts              - synthetic GBM markets w/ adverse-selection model
                  runner.ts, report.ts       - replay pipeline + profitability metrics
-src/apps/        simulate.ts                - paper-trading profitability study (offline)
-                 paper-live.ts              - live-data paper trading + tick recorder (Polymarket)
-                 limitless-paper.ts         - live-data paper trading + tick recorder (Limitless)
-                 record.ts                  - Phase-1 data recorder (no strategy)
-test/            75 smoke/unit tests (vitest)
+src/apps/        simulate.ts, paper-live.ts, limitless-paper.ts, record.ts
+test/            85 unit/smoke tests (vitest)
 ```
 
-## Quick start
+## 5. Design notes: speed and reliability
 
-```bash
-npm install
-npm test                 # 54 tests: math, pricing, fills, guards, risk, sim pipeline
-npm run typecheck
+What the hot path does on every event (no I/O, no allocation-heavy work, no LLMs):
 
-# offline profitability study (synthetic markets, deterministic by seed)
-npm run simulate -- --markets 2000 --seed 42
-npm run simulate -- --markets 1500 --grid        # adverse-selection x entry-price grid
-
-# with outbound network access (Polymarket + Binance reachable):
-npm run record    -- --asset BTC --cadence 300   # Phase 1: record real ticks, no strategy
-npm run paper:live -- --asset BTC --cadence 300  # paper trade against live books
-
-# Limitless (Base) — paper trade + record their 5m Up/Down markets:
-npm run limitless:paper -- --asset BTC --cadence 300
+```
+WS event -> normalize to integers -> update in-memory state -> evaluate strategy
+         -> risk gate -> (paper|live) order action -> async JSONL log
 ```
 
-## Limitless integration
+Speed decisions, informed by what the official clients and public Polymarket bots
+(py-clob-client-v2, poly-market-maker, poly-websockets) do:
 
-Same strategy, second venue (spec addendum Priority 2). The connector layer mirrors
-Polymarket's: REST discovery filters active markets down to short-duration crypto
-"Up or Down" markets, the Socket.IO feed streams books/trades/oracle prices (their
-`oraclePriceData`-style stream is preferred over the Binance proxy when present), and
-`limitless-paper` runs the identical ResolutionMakerSnipe + PaperExchange pipeline,
-recording everything to `data/limitless-*.jsonl`.
+- **Top-of-book from three event types, not just snapshots.** The Polymarket WS client
+  consumes `price_change` (carries `best_bid`/`best_ask` per asset) and `best_bid_ask`
+  (via `custom_feature_enabled: true`) in addition to `book` snapshots, so the strategy
+  reacts without waiting for the next full snapshot.
+- **Settlement-adjacent oracle.** Polymarket short-duration crypto markets resolve on
+  Chainlink; the bot subscribes to RTDS `crypto_prices_chainlink` (official feed) and
+  falls back to Binance only while RTDS is quiet.
+- **Fixed-point integers end to end.** Prices/sizes/PnL are integer micros; strings are
+  parsed once at the edge. No float drift, no Decimal allocations in the hot path.
+- **Persistent sockets + heartbeats.** WS `PING` every 10s (server drops silent
+  connections), RTDS `ping` every 5s, Socket.IO websocket-only transport; exponential
+  backoff reconnect everywhere.
+- **Stale-state safety over uptime.** On any disconnect, books are wiped, resting paper
+  orders are cancelled, and the live executor's `cancelAll` fires. A feed gap can never
+  leave a stale maker order resting (spec B4).
+- **`tick_size_change` handling.** Polymarket rejects orders priced with a stale tick;
+  the WS client surfaces the event and the strategy updates its tick immediately.
+- **One strategy evaluation per event, per market**, with all state in memory; decision
+  logs are bounded and JSONL writes are async.
 
-**Trading service** (`src/execution/limitless-executor.ts`): builds CTF-exchange-style
-CLOB orders (USDC on Base, 6 decimals == our internal micros), signs them EIP-712 via
-`viem`, and submits through the authenticated REST API. Defense in depth:
+Reliability gates (cannot be bypassed by strategy code): per-order/market notional caps,
+open-order and rate limits, daily loss limit, kill switch requiring manual unlock,
+post-loss cooldown, and client-side post-only rejection in both the paper exchange and
+the live executor.
 
-1. Hard-disabled unless `TRADING_ENABLED=true` **and** `LIMITLESS_TRADING_ENABLED=true`.
-2. `LIMITLESS_DRY_RUN` defaults to **on**: orders are built, signed and logged, never POSTed.
-3. Client-side post-only check — a buy that would cross the latest book is rejected locally.
-4. Every order passes the shared `RiskEngine` (same caps as paper).
-5. Failed cancels, missing order ids, and cancel-all failures trip the kill switch.
-6. `LIMITLESS_VERIFYING_CONTRACT` has **no default** — live signing refuses to start
-   until you set the real exchange contract address.
+## 6. API verification status
 
-Env vars:
+Verified against official sources on 2026-06-10:
 
-```bash
-LIMITLESS_API_BASE=https://api.limitless.exchange     # default
-LIMITLESS_WS_BASE=https://ws.limitless.exchange       # default
-LIMITLESS_PRIVATE_KEY=__never_commit__                # EOA on Base, small funds only
-LIMITLESS_VERIFYING_CONTRACT=                         # REQUIRED for live: CTF exchange addr
-LIMITLESS_DOMAIN_NAME="Limitless CTF Exchange"        # VERIFY against docs/contract
-LIMITLESS_CHAIN_ID=8453
-TRADING_ENABLED=false
-LIMITLESS_TRADING_ENABLED=false
-LIMITLESS_DRY_RUN=true
-LIMITLESS_ORDER_TYPE=GTC                              # or GTD + LIMITLESS_ORDER_TTL_SEC
-```
+| Area | Status | Source |
+|---|---|---|
+| Polymarket WS URL, subscribe format, `book`/`price_change`/`best_bid_ask`/`last_trade_price`/`tick_size_change` payloads, PING/PONG | ✅ verified | docs.polymarket.com, Polymarket/agent-skills |
+| Prices can arrive without leading zero (".48") | ✅ handled | Polymarket/agent-skills examples |
+| RTDS URL, subscribe wire format, `crypto_prices_chainlink` topic, 5s ping | ✅ verified | Polymarket/real-time-data-client |
+| Limitless REST: `/markets/active`, `/markets/{slug}`, `/markets/{slug}/orderbook`, `/profiles/me`, `POST /orders`, `DELETE /orders/{id}`, `DELETE /orders/all/{slug}` | ✅ verified | limitless-exchange-ts-sdk |
+| Limitless auth: `X-API-Key` header | ✅ verified | limitless-exchange-ts-sdk |
+| Limitless EIP-712: domain `Limitless CTF Exchange` v1, 12-field CTF order, BUY=0/SELL=1, EOA=0, verifying contract from `market.venue.exchange`, BUY collateral rounds up | ✅ verified | SDK signer.ts/builder.ts |
+| Limitless order payload `{order, orderType, marketSlug, ownerId, postOnly}` | ✅ verified | SDK orders/client.ts |
+| Limitless WS: `wss://ws.limitless.exchange` `/markets` ns, `subscribe_market_prices {marketSlugs}`, `orderbookUpdate`, `oraclePriceData` | ✅ verified | SDK websocket/client.ts + types |
+| Limitless market list response field names (`tokens` vs `clobTokenIds`, `deadline`, `minTickSize`) | ⚠️ VERIFY on first run | parsed defensively with fallbacks |
+| Limitless 5m Up/Down market title/duration filter heuristics | ⚠️ VERIFY on first run | tune `isShortDurationUpDown` |
+| Polymarket gamma 5m/15m slug pattern (`btc-updown-5m-<unixStart>`) | ⚠️ VERIFY on first run | derived from documented 15m example |
 
-### Limitless first-connected-run verification checklist
+Notable structural fact: Limitless's public feed exposes **orderbook updates and oracle
+prices but no public trade prints**, so paper fills there use the PaperExchange
+**book-cross mode** (fill only when the ask quotes through our bid, queue-ahead still
+applied). Polymarket paper fills use observed `last_trade_price` prints.
 
-This integration was written **without** live API access (this build environment blocks
-outbound traffic), against Limitless docs and public reference bots. Items marked
-`VERIFY` in the source must be confirmed on the first networked run, in this order:
+## 7. Strategy in one paragraph
 
-1. `GET /markets/active` — pagination params and response envelope (`data` vs array).
-2. Market fields: `slug`, `deadline`, `tokens.{yes,no}` vs `clobTokenIds`, `minTickSize`.
-3. `GET /markets/{slug}/orderbook` — path and level field names; whether the book is
-   YES-token-denominated (the REST fallback derives the DOWN book as its mirror).
-4. Socket.IO: run once with `LOG_LEVEL=debug`, capture real event names, pin them in
-   `socket.ts` (currently routed by pattern: orderbook/trade/oracle).
-5. Auth: signing-message header names (`x-account`/`x-signature`/`x-signing-message`)
-   and session cookie behavior.
-6. EIP-712 domain: name/version + the verifying contract address of their CTF exchange
-   on Base; cross-check a signed order against their SDK or a known-good payload.
-7. Order POST payload shape (`order`, `orderType`, `marketSlug`, post-only flag name).
+In the final 60s→4s of a 5-minute BTC Up/Down market, if the oracle shows the underlying
+clearly on one side of the strike (gap ≥ 8bps and ≥ 2.5× recent realized vol), the locked
+side's book is priced ≥ $0.95 with a sane spread, and risk gates pass, rest a **post-only**
+bid at `min($0.95, ask − tick)` (joining, never crossing). Cancel instantly if the side
+flips, the gap collapses, the price fades, a feed goes stale, the spread blows out, or
+resolution is < 3s away. One fill per market; after a loss, stand down for 10 markets.
 
-Until 1–5 pass, run paper-only. Until 6–7 are cross-checked, keep `LIMITLESS_DRY_RUN=true`.
+## 8. Paper-trading fill model (why results here are believable)
 
-## Strategy in one paragraph
-
-In the final 60s→4s of a 5-minute BTC Up/Down market, if the proxy oracle shows the
-underlying clearly on one side of the strike (gap ≥ 8bps and ≥ 2.5× recent realized vol),
-the locked side's book is priced ≥ $0.95 with a sane spread, and risk gates pass, rest a
-**post-only** bid at `min($0.95, ask - tick)` (joining, never crossing). Cancel instantly
-if the side flips, the gap collapses, the price fades, a feed goes stale, the spread blows
-out, or resolution is < 3s away. One fill per market; after a loss, stand down for 10
-markets.
-
-## Paper-trading fill model (why results here are believable)
-
-A paper bid only fills when an **observed SELL trade prints at ≤ our price, after our
-placement timestamp + 250ms latency grace**, and only after the visible queue ahead at our
+A paper bid only fills when observed market activity proves it would have: a SELL print at
+≤ our price (Polymarket) or the book quoting through our level (Limitless), after our
+placement timestamp + 250ms latency grace, and only after the visible queue ahead at our
 level is depleted. Post-only orders that would cross are rejected, never converted to
 taker. This kills the classic backtest lie where every $0.95 bid fills.
 
-## Simulation findings (synthetic, 5,000 markets/run, $5 max order)
+## 9. Simulation findings (synthetic, $5 max order)
 
 | config | fills | win rate given fill | total PnL |
 |---|---|---|---|
@@ -137,32 +211,28 @@ taker. This kills the classic backtest lie where every $0.95 bid fills.
 
 Takeaways, consistent with the spec's warnings:
 
-1. **Breakeven at $0.95 is a 95% fill-conditioned win rate.** The sim's adverse-selection
-   drag (2–7pp between "all signals" and "given fill" win rates) is enough to flip the
-   sign. Seed 42 looked profitable; seed 7 with more markets did not — the apparent edge
-   is within tail-risk noise.
-2. **Conditioning is the trap:** when a market is truly locked, the book trades at
-   0.97–0.99 and a capped $0.95 bid can't be placed competitively; when your $0.95 bid is
-   fillable, that's evidence the outcome is less locked than it looks. Tightening filters
-   drove orders to zero rather than to profit.
-3. One full loss erases ~19 wins at $0.95 (~32 at $0.97). Max drawdown reached ~24× the
-   average win in losing runs.
+1. **Breakeven at $0.95 is a 95% fill-conditioned win rate.** Simulated adverse-selection
+   drag (2–7pp between "all signals" and "given fill" win rates) flips the sign; the
+   seed-42 profit is tail-risk noise, not edge.
+2. **Conditioning is the trap:** when a market is truly locked the book trades 0.97–0.99
+   and a capped $0.95 bid can't compete; when your bid IS fillable, the outcome is less
+   locked than it looks. Tightening filters drove orders to zero rather than to profit.
+3. One full loss erases ~19 wins at $0.95 (~32 at $0.97).
 
-**These are synthetic results.** They validate the pipeline and the *sensitivity* of the
-strategy, not real-world PnL. The model's informed-seller intensity is an assumption; the
-real number must be measured. Per spec section G, go/no-go for any real money requires
-1,000+ **recorded** live markets (`npm run record`), fill-conditioned EV measured on real
-trade prints, and positive EV surviving a safety haircut. The sim says: do not expect
-the naive $0.95 snipe to clear that bar without an additional, real edge (e.g. a faster
-oracle feed than the marginal seller).
+**These are synthetic results** — they validate the pipeline and sensitivity, not
+real-world PnL. Per spec §G, go/no-go for real money needs 1,000+ recorded live markets
+(`npm run record`), fill-conditioned EV measured on real prints, and positive EV after a
+safety haircut.
 
-## Live-data caveats
+## 10. Go-live checklist (Limitless)
 
-- `paper-live` settles using the **Binance proxy** feed. Polymarket actually settles
-  short-duration crypto on **Chainlink Data Streams** — never assume they match (spec B5).
-  Wire RTDS/Chainlink in before trusting paper PnL near ties.
-- Connectors were written against documented schemas but could not be exercised against
-  the live APIs from this build environment (no outbound network); verify
-  `gamma.ts` field names and the WS event shapes on first connected run.
-- Heartbeat/cancel-on-disconnect: paper-live cancels all paper orders on WS disconnect.
-  A future live executor must use Polymarket's heartbeat facility and post-only GTC/GTD.
+1. Run `limitless:paper` with `LOG_LEVEL=debug`; confirm the ⚠️ VERIFY items in §6.
+2. Confirm `/profiles/me` returns your `ownerId` with `LIMITLESS_API_KEY` set.
+3. Keep `LIMITLESS_DRY_RUN=true` and inspect a logged signed order against the official
+   SDK output for the same inputs.
+4. Fund a **dedicated** hot wallet with pocket change; approve USDC for the venue
+   exchange contract (the address from `market.venue.exchange`).
+5. Flip `TRADING_ENABLED=true LIMITLESS_TRADING_ENABLED=true LIMITLESS_DRY_RUN=false`
+   with default risk caps ($5/order, $5/market, $25 daily loss).
+6. Verify the first live order's lifecycle end to end (place → cancel → balance check)
+   before letting it run unattended.

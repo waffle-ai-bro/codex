@@ -1,17 +1,21 @@
 import type { PrivateKeyAccount } from "viem/accounts";
-import { notionalUsdMicros } from "../../core/fixed.js";
+import { mulDivCeil, notionalUsdMicros, MICRO } from "../../core/fixed.js";
 
 /**
  * Limitless CLOB order construction + EIP-712 signing.
  *
- * Limitless's CLOB uses a CTF-exchange style order struct (Polymarket lineage)
- * on Base (chainId 8453), settled in USDC (6 decimals — conveniently equal to
- * our internal micros).
+ * Verified against the official SDK (limitless-exchange-ts-sdk, 2026-06):
+ *  - domain: { name: "Limitless CTF Exchange", version: "1", chainId,
+ *    verifyingContract } where the verifying contract is the market's
+ *    venue exchange address (market.venue.exchange), NOT a global constant.
+ *  - 12-field CTF Order struct, Side BUY=0/SELL=1, SignatureType EOA=0.
+ *  - USDC + shares are 6-decimal (== our internal micros).
+ *  - BUY: maker collateral rounds UP; SELL: taker collateral rounds DOWN.
+ *  - Order types GTC (supports postOnly), FOK, FAK.
  *
- * VERIFY before live trading: the EIP-712 domain (name/version/verifying
- * contract) must be confirmed against Limitless docs or the on-chain exchange
- * contract. The verifying contract has NO default — trading refuses to start
- * without LIMITLESS_VERIFYING_CONTRACT set.
+ * Known Base mainnet constants (SDK):
+ *  - USDC 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+ *  - CTF  0xC9c98965297Bc527861c898329Ee280632B76e18
  */
 
 export const BASE_CHAIN_ID = 8453;
@@ -23,12 +27,16 @@ export interface LimitlessDomainConfig {
   verifyingContract: `0x${string}`;
 }
 
-export function domainFromEnv(): LimitlessDomainConfig {
-  const verifying = process.env["LIMITLESS_VERIFYING_CONTRACT"];
-  if (!verifying || !/^0x[0-9a-fA-F]{40}$/.test(verifying)) {
-    throw new Error(
-      "LIMITLESS_VERIFYING_CONTRACT must be set to the Limitless CTF exchange address (see README verification checklist)",
-    );
+/**
+ * Domain for a given exchange contract. The exchange address normally comes
+ * from the market's venue data (market.venue.exchange); the env var
+ * LIMITLESS_VERIFYING_CONTRACT acts as an override/pin.
+ */
+export function domainFor(exchangeAddress: string): LimitlessDomainConfig {
+  const pinned = process.env["LIMITLESS_VERIFYING_CONTRACT"];
+  const verifying = pinned && /^0x[0-9a-fA-F]{40}$/.test(pinned) ? pinned : exchangeAddress;
+  if (!/^0x[0-9a-fA-F]{40}$/.test(verifying)) {
+    throw new Error(`invalid Limitless exchange address: ${JSON.stringify(verifying)}`);
   }
   return {
     name: process.env["LIMITLESS_DOMAIN_NAME"] ?? "Limitless CTF Exchange",
@@ -36,6 +44,17 @@ export function domainFromEnv(): LimitlessDomainConfig {
     chainId: Number(process.env["LIMITLESS_CHAIN_ID"] ?? BASE_CHAIN_ID),
     verifyingContract: verifying as `0x${string}`,
   };
+}
+
+/** Env-only domain (requires LIMITLESS_VERIFYING_CONTRACT). */
+export function domainFromEnv(): LimitlessDomainConfig {
+  const verifying = process.env["LIMITLESS_VERIFYING_CONTRACT"];
+  if (!verifying) {
+    throw new Error(
+      "LIMITLESS_VERIFYING_CONTRACT not set; prefer passing the market's venue.exchange address to domainFor()",
+    );
+  }
+  return domainFor(verifying);
 }
 
 export const ORDER_TYPES = {
@@ -91,8 +110,9 @@ export interface BuildOrderArgs {
 
 /**
  * Build a CLOB order from price/size in micros.
- * BUY:  makerAmount = USDC paid (price*size), takerAmount = shares received.
- * SELL: makerAmount = shares sold,           takerAmount = USDC received.
+ * BUY:  makerAmount = USDC paid (price*size, rounded UP per official SDK),
+ *       takerAmount = shares received.
+ * SELL: makerAmount = shares sold, takerAmount = USDC received (rounded down).
  * USDC and CTF shares are both 6-decimal, identical to our micros.
  */
 export function buildClobOrder(args: BuildOrderArgs): ClobOrder {
@@ -100,7 +120,10 @@ export function buildClobOrder(args: BuildOrderArgs): ClobOrder {
     throw new Error(`price out of (0,1): ${args.priceMicros}`);
   }
   if (args.sizeMicros <= 0) throw new Error("size must be positive");
-  const usdc = BigInt(notionalUsdMicros(args.priceMicros, args.sizeMicros));
+  const usdc =
+    args.side === "BUY"
+      ? BigInt(mulDivCeil(args.priceMicros, args.sizeMicros, MICRO))
+      : BigInt(notionalUsdMicros(args.priceMicros, args.sizeMicros));
   const shares = BigInt(args.sizeMicros);
   return {
     salt: args.salt ?? randomSalt(),

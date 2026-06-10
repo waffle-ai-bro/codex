@@ -7,6 +7,7 @@ import {
   gapBps,
   midMicros,
   mulDiv,
+  mulDivCeil,
   notionalUsdMicros,
   parseMicros,
 } from "../src/core/fixed.js";
@@ -18,8 +19,21 @@ describe("fixed-point math", () => {
     expect(parseMicros("0.001")).toBe(1_000);
     expect(parseMicros("104999.123456")).toBe(104_999_123_456);
     expect(parseMicros("-0.5")).toBe(-500_000);
+    // Polymarket WS sends prices without a leading zero (e.g. ".48").
+    expect(parseMicros(".48")).toBe(480_000);
+    expect(parseMicros("-.05")).toBe(-50_000);
     expect(() => parseMicros("abc")).toThrow();
     expect(() => parseMicros("1e5")).toThrow();
+    expect(() => parseMicros(".")).toThrow();
+    expect(() => parseMicros("")).toThrow();
+  });
+
+  it("mulDivCeil rounds up (venue collateral rounding)", () => {
+    expect(mulDivCeil(333_333, 500_000, 1_000_000)).toBe(166_667); // floor would be 166666
+    expect(mulDiv(333_333, 500_000, 1_000_000)).toBe(166_666);
+    expect(mulDivCeil(950_000, 10_000_000, 1_000_000)).toBe(9_500_000); // exact stays exact
+    const big = 90_000_000_000_000;
+    expect(mulDivCeil(big, 1_000_000, 1_000_000)).toBe(big);
   });
 
   it("round-trips format/parse", () => {

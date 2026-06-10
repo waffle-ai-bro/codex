@@ -18,12 +18,14 @@ export function assertInt(n: number, label = "value"): number {
   return n;
 }
 
-/** Parse a decimal string like "0.95" into micros (exact, no float). */
+/** Parse a decimal string like "0.95", ".48" or "104999.12" into micros (exact, no float). */
 export function parseMicros(s: string): number {
-  const m = /^(-?)(\d+)(?:\.(\d+))?$/.exec(s.trim());
-  if (!m) throw new Error(`cannot parse decimal: ${JSON.stringify(s)}`);
+  const m = /^(-?)(\d*)(?:\.(\d+))?$/.exec(s.trim());
+  if (!m || (m[2] === "" && (m[3] === undefined || m[3] === ""))) {
+    throw new Error(`cannot parse decimal: ${JSON.stringify(s)}`);
+  }
   const sign = m[1] === "-" ? -1 : 1;
-  const whole = m[2]!;
+  const whole = m[2] === "" ? "0" : m[2]!;
   const frac = (m[3] ?? "").slice(0, 6).padEnd(6, "0");
   const value = Number(whole) * MICRO + Number(frac);
   return assertInt(sign * value, "parsed micros");
@@ -51,6 +53,21 @@ export function mulDiv(a: number, b: number, c: number): number {
     return Math.floor(product / c);
   }
   return Number((BigInt(a) * BigInt(b)) / BigInt(c));
+}
+
+/** ceil(a * b / c) on integers (used where venues round collateral up). */
+export function mulDivCeil(a: number, b: number, c: number): number {
+  assertInt(a);
+  assertInt(b);
+  assertInt(c);
+  if (c === 0) throw new Error("mulDivCeil: divide by zero");
+  const product = a * b;
+  if (Number.isSafeInteger(product)) {
+    return Math.ceil(product / c);
+  }
+  const p = BigInt(a) * BigInt(b);
+  const q = BigInt(c);
+  return Number((p + q - 1n) / q);
 }
 
 /** Notional usdMicros for a fill: price * size. */

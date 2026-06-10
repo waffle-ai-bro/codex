@@ -7,6 +7,7 @@ import {
   SIDE_BUY,
   SIDE_SELL,
   buildClobOrder,
+  domainFor,
   orderToWire,
   signClobOrder,
   type LimitlessDomainConfig,
@@ -53,6 +54,28 @@ describe("buildClobOrder", () => {
     expect(o.makerAmount).toBe(10_000_000n);
     expect(o.takerAmount).toBe(9_500_000n);
     expect(o.side).toBe(SIDE_SELL);
+  });
+
+  it("BUY collateral rounds UP, SELL collateral rounds down (SDK behavior)", () => {
+    // 0.5 share at $0.333333: exact collateral 166666.5 micros
+    const buy = buildClobOrder({
+      maker: account.address,
+      tokenId: "1",
+      side: "BUY",
+      priceMicros: 333_333,
+      sizeMicros: 500_000,
+      salt: 1n,
+    });
+    expect(buy.makerAmount).toBe(166_667n); // ceil
+    const sell = buildClobOrder({
+      maker: account.address,
+      tokenId: "1",
+      side: "SELL",
+      priceMicros: 333_333,
+      sizeMicros: 500_000,
+      salt: 1n,
+    });
+    expect(sell.takerAmount).toBe(166_666n); // floor
   });
 
   it("rejects prices outside (0,1) and non-positive sizes", () => {
@@ -118,6 +141,21 @@ describe("signClobOrder", () => {
     const c = await signClobOrder(account, domain, buildClobOrder({ ...args, salt: 2n }));
     expect(a).toBe(b);
     expect(a).not.toBe(c);
+  });
+});
+
+describe("domainFor", () => {
+  it("builds the SDK-verified domain from a venue exchange address", () => {
+    const d = domainFor("0x00000000000000000000000000000000000000aa");
+    expect(d.name).toBe("Limitless CTF Exchange");
+    expect(d.version).toBe("1");
+    expect(d.chainId).toBe(8453);
+    expect(d.verifyingContract).toBe("0x00000000000000000000000000000000000000aa");
+  });
+
+  it("rejects malformed addresses", () => {
+    expect(() => domainFor("not-an-address")).toThrow();
+    expect(() => domainFor("")).toThrow();
   });
 });
 

@@ -17,10 +17,9 @@ import { loadRiskLimits, loadSnipeConfig } from "../core/config.js";
 import { Logger } from "../core/logger.js";
 import { formatMicros, MICRO } from "../core/fixed.js";
 import type { Asset, BookTop, MarketInfo, OracleTick, UpDown } from "../core/types.js";
+import { privateKeyToAccount } from "viem/accounts";
 import { LimitlessClient } from "../connectors/limitless/client.js";
 import { LimitlessSocket } from "../connectors/limitless/socket.js";
-import { accountFromEnv, login } from "../connectors/limitless/auth.js";
-import { domainFromEnv } from "../connectors/limitless/orders.js";
 import { LimitlessExecutor, executorOptionsFromEnv } from "../execution/limitless-executor.js";
 import { BinanceOracle } from "../oracle/binance.js";
 import { PaperExchange } from "../execution/paper-exchange.js";
@@ -41,18 +40,21 @@ function parseArgs(): { asset: Asset; cadence: 300 | 900 } {
 }
 
 async function maybeBuildExecutor(client: LimitlessClient, risk: RiskEngine): Promise<LimitlessExecutor | null> {
-  if (!process.env["LIMITLESS_PRIVATE_KEY"]) return null;
+  const pk = process.env["LIMITLESS_PRIVATE_KEY"];
+  if (!pk) return null;
   try {
-    const account = accountFromEnv();
-    const domain = domainFromEnv();
+    if (!/^0x[0-9a-fA-F]{64}$/.test(pk)) throw new Error("LIMITLESS_PRIVATE_KEY malformed");
+    const account = privateKeyToAccount(pk as `0x${string}`);
     const options = executorOptionsFromEnv();
+    const executor = new LimitlessExecutor(client, account, risk, options);
     if (options.enabled && !options.dryRun) {
-      await login(client, account);
+      if (!client.hasApiKey) throw new Error("LIMITLESS_API_KEY required for live trading");
+      await executor.loadProfile(); // ownerId is mandatory on order payloads
       log.warn("LIVE Limitless trading is ENABLED — orders will be submitted");
     } else {
       log.info("Limitless executor in dry-run (orders signed but not submitted)");
     }
-    return new LimitlessExecutor(client, account, domain, risk, options);
+    return executor;
   } catch (err) {
     log.warn("executor not started", { message: (err as Error).message });
     return null;
@@ -64,7 +66,9 @@ async function main(): Promise<void> {
   const snipeCfg = loadSnipeConfig();
   const risk = new RiskEngine(loadRiskLimits());
   const strategy = new ResolutionMakerSnipe(snipeCfg, risk);
-  const exchange = new PaperExchange();
+  // Limitless's public feed has no trade prints, so paper fills use the
+  // book-cross mode: fill only when the ask quotes through our bid level.
+  const exchange = new PaperExchange(250, true);
   const client = new LimitlessClient();
   const executor = await maybeBuildExecutor(client, risk);
 
@@ -131,6 +135,7 @@ async function main(): Promise<void> {
                 tokenId: action.tokenId,
                 priceMicros: action.priceMicros,
                 sizeMicros: action.sizeMicros,
+                ...(market.exchangeAddress ? { exchangeAddress: market.exchangeAddress } : {}),
               })
               .then((placed) => {
                 record("live-order", placed);
@@ -156,7 +161,15 @@ async function main(): Promise<void> {
     if (!current) return;
     record("book", top);
     strategy.onBook(current.id, top);
-    exchange.onBook(top);
+    // Book-cross mode: book updates can generate paper fills on this venue.
+    const fills = exchange.onBook(top);
+    for (const f of fills) {
+      strategy.onFill(f);
+      risk.onFill(f.marketId, f.priceMicros, f.sizeMicros);
+      risk.onOrderClosed();
+      record("fill", f);
+      log.info("paper FILL (book-cross)", { order: f.orderId, price: formatMicros(f.priceMicros, 3) });
+    }
     executor?.onBook(top);
     applyActions();
   };

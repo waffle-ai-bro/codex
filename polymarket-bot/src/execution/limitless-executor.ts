@@ -3,9 +3,10 @@ import { Logger } from "../core/logger.js";
 import { formatMicros } from "../core/fixed.js";
 import type { BookTop } from "../core/types.js";
 import type { RiskEngine } from "../risk/risk-engine.js";
-import type { LimitlessClient } from "../connectors/limitless/client.js";
+import type { LimitlessClient, LimitlessProfile } from "../connectors/limitless/client.js";
 import {
   buildClobOrder,
+  domainFor,
   orderToWire,
   signClobOrder,
   type LimitlessDomainConfig,
@@ -13,6 +14,11 @@ import {
 
 /**
  * Limitless live trading service.
+ *
+ * Order payload verified against the official SDK (2026-06):
+ *   POST /orders { order: {...signed}, orderType, marketSlug, ownerId, postOnly? }
+ * ownerId comes from GET /profiles/me; the EIP-712 verifying contract comes
+ * from the market's venue exchange address.
  *
  * Safety model (spec §10):
  *  - DISABLED unless both TRADING_ENABLED=true and LIMITLESS_TRADING_ENABLED=true.
@@ -53,23 +59,43 @@ export interface PlacedOrder {
 export class LimitlessExecutor {
   private readonly log = new Logger("limitless-executor");
   private readonly lastBook = new Map<string, BookTop>();
-  /** Our open order ids per market, for targeted cancels. */
-  private readonly openOrders = new Map<string, string>();
+  /** marketId -> { orderId, slug } for targeted and bulk cancels. */
+  private readonly openOrders = new Map<string, { orderId: string; slug: string }>();
+  private profile: LimitlessProfile | null = null;
 
   constructor(
     private readonly client: LimitlessClient,
     private readonly account: PrivateKeyAccount,
-    private readonly domain: LimitlessDomainConfig,
     private readonly risk: RiskEngine,
     private readonly options: LimitlessExecutorOptions,
+    /** Fallback domain when a market carries no venue exchange address. */
+    private readonly defaultDomain: LimitlessDomainConfig | null = null,
   ) {
     if (!options.enabled && !options.dryRun) {
       throw new Error("executor constructed with trading disabled and dryRun off — nothing it could do");
     }
   }
 
+  /** Fetch ownerId/feeRateBps once after auth. Required before live orders. */
+  async loadProfile(): Promise<LimitlessProfile> {
+    this.profile = await this.client.fetchProfile();
+    this.log.info("profile loaded", { ownerId: this.profile.ownerId, feeRateBps: this.profile.feeRateBps });
+    return this.profile;
+  }
+
+  /** Test hook / cached-profile injection. */
+  setProfile(profile: LimitlessProfile): void {
+    this.profile = profile;
+  }
+
   onBook(top: BookTop): void {
     this.lastBook.set(top.tokenId, top);
+  }
+
+  private resolveDomain(exchangeAddress?: string): LimitlessDomainConfig {
+    if (exchangeAddress) return domainFor(exchangeAddress);
+    if (this.defaultDomain) return this.defaultDomain;
+    throw new Error("no exchange address: market venue data missing and no default domain configured");
   }
 
   async placePostOnlyBuy(args: {
@@ -78,6 +104,8 @@ export class LimitlessExecutor {
     tokenId: string;
     priceMicros: number;
     sizeMicros: number;
+    /** market.venue.exchange — the EIP-712 verifying contract. */
+    exchangeAddress?: string;
   }): Promise<PlacedOrder> {
     // 1. Risk gate (shared engine, same limits as paper).
     const violations = this.risk.check(args.marketId, args.priceMicros, args.sizeMicros);
@@ -92,7 +120,13 @@ export class LimitlessExecutor {
       return { id: "", status: "rejected", rejectReason: "post-only would cross" };
     }
 
-    // 3. Build + sign.
+    // 3. Build + sign with the market's venue exchange as verifying contract.
+    let domain: LimitlessDomainConfig;
+    try {
+      domain = this.resolveDomain(args.exchangeAddress);
+    } catch (err) {
+      return { id: "", status: "rejected", rejectReason: (err as Error).message };
+    }
     const expirationSec =
       this.options.orderType === "GTD"
         ? Math.floor(Date.now() / 1000) + (this.options.ttlSec ?? 120)
@@ -103,14 +137,16 @@ export class LimitlessExecutor {
       side: "BUY",
       priceMicros: args.priceMicros,
       sizeMicros: args.sizeMicros,
+      feeRateBps: this.profile?.feeRateBps ?? 0,
       expirationSec,
     });
-    const signature = await signClobOrder(this.account, this.domain, order);
-    const payload = {
+    const signature = await signClobOrder(this.account, domain, order);
+    const payload: Record<string, unknown> = {
       order: orderToWire(order, signature),
-      orderType: this.options.orderType,
+      orderType: this.options.orderType === "GTD" ? "GTC" : this.options.orderType, // venue enum: GTC/FOK/FAK
       marketSlug: args.marketSlug,
-      postOnly: true, // VERIFY: server-side post-only flag name
+      ownerId: this.profile?.ownerId,
+      postOnly: true,
     };
 
     this.log.info("order built", {
@@ -124,6 +160,9 @@ export class LimitlessExecutor {
     if (this.options.dryRun || !this.options.enabled) {
       return { id: `dry-${Date.now()}`, status: "dry-run" };
     }
+    if (this.profile === null) {
+      return { id: "", status: "rejected", rejectReason: "profile not loaded (ownerId required)" };
+    }
     try {
       const res = (await this.client.submitOrder(payload)) as Record<string, unknown>;
       const id = String(res["id"] ?? res["orderId"] ?? "");
@@ -131,7 +170,7 @@ export class LimitlessExecutor {
         this.risk.trip("order submitted but no id returned — state unknown");
         return { id: "", status: "rejected", rejectReason: "no order id in response" };
       }
-      this.openOrders.set(args.marketId, id);
+      this.openOrders.set(args.marketId, { orderId: id, slug: args.marketSlug });
       this.risk.onOrderPlaced();
       return { id, status: "open" };
     } catch (err) {
@@ -157,12 +196,16 @@ export class LimitlessExecutor {
 
   /** Used by kill-switch and disconnect paths. Best effort, then verify. */
   async cancelAll(): Promise<void> {
+    const slugs = new Set<string>();
+    for (const { slug } of this.openOrders.values()) slugs.add(slug);
     this.openOrders.clear();
     if (this.options.dryRun || !this.options.enabled) return;
-    try {
-      await this.client.cancelAllOrders();
-    } catch (err) {
-      this.risk.trip(`cancel-all failed: ${(err as Error).message}`);
+    for (const slug of slugs) {
+      try {
+        await this.client.cancelAllOrders(slug);
+      } catch (err) {
+        this.risk.trip(`cancel-all failed for ${slug}: ${(err as Error).message}`);
+      }
     }
   }
 }

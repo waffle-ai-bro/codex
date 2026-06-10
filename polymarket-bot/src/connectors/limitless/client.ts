@@ -7,15 +7,19 @@ import type { Asset, BookTop, MarketInfo } from "../../core/types.js";
  * Limitless Exchange (Base) REST client — market data + authenticated order
  * endpoints for the CLOB.
  *
- * API base: https://api.limitless.exchange
- * Docs/reference implementations:
- *   - https://github.com/moondevonyt/Limitless-Prediction-Market-Bots
- *   - Limitless API docs (https://docs.limitless.exchange)
+ * Verified against the official SDK (limitless-labs-group/
+ * limitless-exchange-ts-sdk, 2026-06):
+ *   - base URL https://api.limitless.exchange
+ *   - GET  /markets/active?limit=&page=&sortBy=
+ *   - GET  /markets/{slug}
+ *   - GET  /markets/{slug}/orderbook
+ *   - GET  /profiles/me                      (ownerId + feeRateBps for orders)
+ *   - POST /orders, DELETE /orders/{id}, DELETE /orders/all/{marketSlug}
+ *   - auth header: X-API-Key (env LIMITLESS_API_KEY)
+ *   - exchange (EIP-712 verifying contract) comes from market venue data
  *
- * VERIFY-ON-FIRST-RUN: this client was written without live network access.
- * Field names are parsed defensively (zod + fallbacks) but the first connected
- * run must confirm: market list filters, orderbook field names, auth header
- * names, and the order submission payload. Every assumption is marked VERIFY.
+ * Remaining VERIFY markers are response-shape assumptions that zod parses
+ * defensively; confirm them on the first connected run.
  */
 
 const log = new Logger("limitless-client");
@@ -45,8 +49,17 @@ const LimitlessMarketSchema = z
     tradeType: z.string().optional(), // e.g. "clob"
     marketType: z.string().optional(), // e.g. "single"
     priceOracleId: z.union([z.string(), z.number()]).optional(),
-    // tick size if exposed. VERIFY: default 0.001 for crypto markets.
+    // tick size if exposed. Official SDK default tick is 0.001.
     minTickSize: z.union([z.string(), z.number()]).optional(),
+    // CLOB/NegRisk exchange contracts come from the venue system (SDK:
+    // market.venue.exchange / market.venue.adapter).
+    venue: z
+      .object({
+        exchange: z.string().optional(),
+        adapter: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
   })
   .passthrough();
 
@@ -156,6 +169,7 @@ export function normalizeLimitlessMarket(
     downTokenId: noToken,
     tickSizeMicros: m.minTickSize !== undefined ? toMicros(m.minTickSize) : 1_000,
     negRisk: false,
+    ...(m.venue?.exchange ? { exchangeAddress: m.venue.exchange } : {}),
   };
 }
 
@@ -195,30 +209,40 @@ export function normalizeLimitlessBook(
 
 // ---------- client ----------
 
-export interface LimitlessSession {
-  /** Cookie header value returned by login (session auth). */
-  cookie?: string;
-  /** Extra headers (e.g. x-account) kept for authenticated calls. */
-  headers: Record<string, string>;
+const ProfileSchema = z
+  .object({
+    id: z.union([z.string(), z.number()]),
+    account: z.string().optional(),
+    rank: z.object({ feeRateBps: z.union([z.string(), z.number()]).optional() }).passthrough().optional(),
+  })
+  .passthrough();
+
+export interface LimitlessProfile {
+  ownerId: number;
+  account?: string;
+  feeRateBps: number;
 }
 
 export class LimitlessClient {
+  private readonly apiKey: string | undefined;
+
   constructor(
     private readonly base = LIMITLESS_API_BASE,
-    private session: LimitlessSession = { headers: {} },
-  ) {}
+    apiKey = process.env["LIMITLESS_API_KEY"],
+  ) {
+    this.apiKey = apiKey;
+  }
 
-  setSession(session: LimitlessSession): void {
-    this.session = session;
+  get hasApiKey(): boolean {
+    return this.apiKey !== undefined && this.apiKey.length > 0;
   }
 
   private async request(path: string, init: RequestInit = {}): Promise<unknown> {
     const headers: Record<string, string> = {
       accept: "application/json",
-      ...this.session.headers,
       ...((init.headers as Record<string, string>) ?? {}),
     };
-    if (this.session.cookie) headers["cookie"] = this.session.cookie;
+    if (this.apiKey) headers["X-API-Key"] = this.apiKey;
     if (init.body) headers["content-type"] = "application/json";
     const res = await fetch(`${this.base}${path}`, { ...init, headers });
     if (!res.ok) {
@@ -229,9 +253,19 @@ export class LimitlessClient {
     return ct.includes("json") ? res.json() : res.text();
   }
 
-  /** Active markets, paginated. VERIFY endpoint/params on first run. */
-  async fetchActiveMarkets(limit = 100, page = 1): Promise<LimitlessMarket[]> {
-    const body = await this.request(`/markets/active?limit=${limit}&page=${page}`);
+  /** Authenticated profile; `id` is the ownerId required on order payloads. */
+  async fetchProfile(): Promise<LimitlessProfile> {
+    const body = ProfileSchema.parse(await this.request("/profiles/me"));
+    return {
+      ownerId: Number(body.id),
+      ...(body.account !== undefined ? { account: body.account } : {}),
+      feeRateBps: Number(body.rank?.feeRateBps ?? 0),
+    };
+  }
+
+  /** Active markets, paginated (SDK: limit/page/sortBy, e.g. "ending_soon"). */
+  async fetchActiveMarkets(limit = 100, page = 1, sortBy = "ending_soon"): Promise<LimitlessMarket[]> {
+    const body = await this.request(`/markets/active?limit=${limit}&page=${page}&sortBy=${sortBy}`);
     // Response may be an array or {data: [...]}.
     const arr = Array.isArray(body) ? body : ((body as { data?: unknown[] }).data ?? []);
     const out: LimitlessMarket[] = [];
@@ -248,7 +282,7 @@ export class LimitlessClient {
     return LimitlessMarketSchema.parse(body);
   }
 
-  /** CLOB orderbook for a market. VERIFY path (`/markets/{slug}/orderbook`). */
+  /** CLOB orderbook for a market (SDK-confirmed path). */
   async fetchOrderbook(slug: string): Promise<LimitlessOrderbook> {
     const body = await this.request(`/markets/${encodeURIComponent(slug)}/orderbook`);
     return OrderbookSchema.parse(body);
@@ -279,7 +313,10 @@ export class LimitlessClient {
 
   // ---------- authenticated order endpoints (used by the executor) ----------
 
-  /** Submit a signed CLOB order. VERIFY payload shape on first run. */
+  /**
+   * Submit a signed CLOB order. SDK-confirmed payload:
+   * { order: {...unsignedOrder, signature}, orderType, marketSlug, ownerId, postOnly? }
+   */
   async submitOrder(payload: Record<string, unknown>): Promise<unknown> {
     return this.request("/orders", { method: "POST", body: JSON.stringify(payload) });
   }
@@ -288,10 +325,9 @@ export class LimitlessClient {
     return this.request(`/orders/${encodeURIComponent(orderId)}`, { method: "DELETE" });
   }
 
-  /** Cancel all open orders, optionally per market. VERIFY endpoint. */
-  async cancelAllOrders(marketSlug?: string): Promise<unknown> {
-    const qs = marketSlug ? `?market=${encodeURIComponent(marketSlug)}` : "";
-    return this.request(`/orders/all${qs}`, { method: "DELETE" });
+  /** Cancel all open orders in a market (SDK: DELETE /orders/all/{marketSlug}). */
+  async cancelAllOrders(marketSlug: string): Promise<unknown> {
+    return this.request(`/orders/all/${encodeURIComponent(marketSlug)}`, { method: "DELETE" });
   }
 
   async fetchOpenOrders(marketSlug?: string): Promise<unknown> {

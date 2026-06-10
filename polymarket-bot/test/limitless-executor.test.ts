@@ -30,10 +30,8 @@ function makeMockClient() {
 
 function makeExecutor(opts: { enabled: boolean; dryRun: boolean }, client = makeMockClient()) {
   const risk = new RiskEngine(loadRiskLimits(), () => 0);
-  const executor = new LimitlessExecutor(client, account, domain, risk, {
-    ...opts,
-    orderType: "GTC",
-  });
+  const executor = new LimitlessExecutor(client, account, risk, { ...opts, orderType: "GTC" }, domain);
+  executor.setProfile({ ownerId: 777, feeRateBps: 0 });
   return { executor, risk, client };
 }
 
@@ -65,7 +63,7 @@ describe("LimitlessExecutor safety gating", () => {
     expect(client.submitOrder).not.toHaveBeenCalled();
   });
 
-  it("submits when live trading is enabled", async () => {
+  it("submits when live trading is enabled, with SDK-verified payload shape", async () => {
     const { executor, client } = makeExecutor({ enabled: true, dryRun: false });
     feedBook(executor);
     const placed = await executor.placePostOnlyBuy(ORDER_ARGS);
@@ -75,6 +73,40 @@ describe("LimitlessExecutor safety gating", () => {
     const payload = client.submitOrder.mock.calls[0]![0] as Record<string, unknown>;
     expect(payload["postOnly"]).toBe(true);
     expect(payload["orderType"]).toBe("GTC");
+    expect(payload["ownerId"]).toBe(777);
+    expect(payload["marketSlug"]).toBe("m1");
+    const order = payload["order"] as Record<string, unknown>;
+    expect(order["signature"]).toMatch(/^0x/);
+  });
+
+  it("uses the market venue exchange address for signing when provided", async () => {
+    const { executor, client } = makeExecutor({ enabled: true, dryRun: false });
+    feedBook(executor);
+    const placed = await executor.placePostOnlyBuy({
+      ...ORDER_ARGS,
+      exchangeAddress: "0x00000000000000000000000000000000000000bb",
+    });
+    expect(placed.status).toBe("open");
+    expect(client.submitOrder).toHaveBeenCalledOnce();
+  });
+
+  it("rejects live orders when the profile (ownerId) is not loaded", async () => {
+    const risk = new RiskEngine(loadRiskLimits(), () => 0);
+    const client = makeMockClient();
+    const executor = new LimitlessExecutor(client, account, risk, { enabled: true, dryRun: false, orderType: "GTC" }, domain);
+    feedBook(executor);
+    const placed = await executor.placePostOnlyBuy(ORDER_ARGS);
+    expect(placed.status).toBe("rejected");
+    expect(placed.rejectReason).toMatch(/profile/);
+    expect(client.submitOrder).not.toHaveBeenCalled();
+  });
+
+  it("cancelAll cancels per market slug for tracked orders", async () => {
+    const { executor, client } = makeExecutor({ enabled: true, dryRun: false });
+    feedBook(executor);
+    await executor.placePostOnlyBuy(ORDER_ARGS);
+    await executor.cancelAll();
+    expect(client.cancelAllOrders).toHaveBeenCalledWith("m1");
   });
 
   it("rejects locally when the bid would cross the book", async () => {
